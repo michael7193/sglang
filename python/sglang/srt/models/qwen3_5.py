@@ -1175,16 +1175,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return None
 
-    def get_embed_and_head(self):
-        embed = self.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
-        return embed, head
-
-    def set_embed_and_head(self, embed, head):
-        if self.pp_group.is_first_rank and embed is not None:
-            self.embed_tokens.weight = embed
-        if self.pp_group.is_last_rank and head is not None:
-            self.lm_head.weight = head
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
