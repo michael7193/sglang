@@ -24,13 +24,16 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
+import numpy.typing as npt
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.layer_kv_events import LayerKVReadyCollector
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -412,6 +415,48 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
+    def _can_use_layer_pipelined_kv_transfer(self: Scheduler, batch: ScheduleBatch) -> bool:
+        if not envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
+            return False
+        if self.enable_overlap or self.enable_staging:
+            return False
+        if self.transfer_backend not in (TransferBackend.MOONCAKE, TransferBackend.FAKE):
+            return False
+        if self.ps.pp_size > 1 or self.ps.attn_cp_size > 1:
+            return False
+        if self.server_args.enable_dp_attention:
+            return False
+        if not self.spec_algorithm.is_none() or batch.spec_info is not None:
+            return False
+        if not batch.forward_mode.is_extend() or batch.chunked_req is not None:
+            return False
+        if getattr(batch, "input_embeds", None) is not None:
+            return False
+        if any(
+            req.pending_bootstrap
+            or req.inflight_middle_chunks > 0
+            or req.multimodal_inputs is not None
+            or req.input_embeds is not None
+            for req in batch.reqs
+        ):
+            return False
+
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        if getattr(kv_args, "mla_compression_ratios", None):
+            return False
+        if getattr(kv_args, "state_types", None):
+            return False
+
+        return torch.cuda.is_available()
+
+    def prepare_layer_pipelined_kv_transfer(self: Scheduler, batch: ScheduleBatch) -> None:
+        if self._can_use_layer_pipelined_kv_transfer(batch):
+            batch.layer_kv_ready_collector = LayerKVReadyCollector(
+                self.model_config.num_hidden_layers
+            )
+        else:
+            batch.layer_kv_ready_collector = None
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -435,6 +480,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                self.prepare_layer_pipelined_kv_transfer(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -472,6 +518,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                self.prepare_layer_pipelined_kv_transfer(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -525,6 +572,8 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+
+        layer_kv_ready_collector = getattr(batch, "layer_kv_ready_collector", None)
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -604,7 +653,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                if not self.send_layer_pipelined_kv(req, layer_kv_ready_collector):
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -904,15 +954,60 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-    def send_kv_chunk(
+    def _get_last_chunk_state_indices(self: Scheduler, req: Req) -> Optional[List]:
+        self.disagg_metadata_buffers.set_buf(req)
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        seq_len = min(req.fill_len, len(req.origin_input_ids))
+
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.sliding_window_size
+            window_start = max(0, seq_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ]
+            return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+        state_indices = []
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        for st in state_types:
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _get_kv_page_indices_for_send(
         self: Scheduler,
         req: Req,
-        last_chunk: bool = False,
+        last_chunk: bool,
         end_idx: Optional[int] = None,
-    ) -> None:
-        """
-        Send a prefilled chunk to the decode server
-        """
+    ) -> Tuple[Optional[npt.NDArray[np.int32]], int]:
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
@@ -922,7 +1017,6 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
-            # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
         if end_idx < start_idx:
@@ -932,71 +1026,58 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
             )
-            return
+            return None, end_idx
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
             .cpu()
             .numpy()
         )
-        state_indices: Optional[List] = None
-        if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+        return kv_to_page_indices(kv_indices, page_size), end_idx
 
-            # fill_ids includes the token sampled during prefill, but decode
-            # registers state pages over origin_input_ids (DecodePreallocQueue)
-            # and the main pool send is clamped to end_idx above. Matching that
-            # length here avoids emitting an extra state page when the sampled
-            # token crosses a page boundary, which mismatched src/dst lengths in
-            # group_concurrent_contiguous.
-            seq_len = min(req.fill_len, len(req.origin_input_ids))
+    def send_layer_pipelined_kv(
+        self: Scheduler,
+        req: Req,
+        collector: Optional[LayerKVReadyCollector],
+    ) -> bool:
+        if collector is None or not collector.all_ready():
+            return False
 
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
+        page_indices, end_idx = self._get_kv_page_indices_for_send(req, last_chunk=True)
+        if page_indices is None or not req.disagg_kv_sender.should_send_kv_chunk(
+            len(page_indices), True
+        ):
+            return False
 
-            def _swa_payload():
-                window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
-
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        for layer_id in range(len(collector.events)):
+            req.disagg_kv_sender.send_layer(
+                page_indices,
+                layer_id,
+                collector.events[layer_id],
+                is_last=layer_id == len(collector.events) - 1,
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                else:
-                    state_indices.append(None)
+        req.disagg_kv_sender.send_final_metadata(
+            self._get_last_chunk_state_indices(req)
+        )
+        req.start_send_idx = end_idx
+        return True
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
+    def send_kv_chunk(
+        self: Scheduler,
+        req: Req,
+        last_chunk: bool = False,
+        end_idx: Optional[int] = None,
+    ) -> None:
+        """
+        Send a prefilled chunk to the decode server
+        """
+        page_indices, end_idx = self._get_kv_page_indices_for_send(
+            req, last_chunk, end_idx
+        )
+        if page_indices is None:
+            return
+        state_indices = self._get_last_chunk_state_indices(req) if last_chunk else None
+
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
