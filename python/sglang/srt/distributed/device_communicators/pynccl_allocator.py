@@ -6,12 +6,20 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+from torch.cuda.memory import CUDAPluggableAllocator
+
+try:
+    from torch.cuda.memory import _cuda_beginAllocateCurrentThreadToPool
+except ImportError:
+    _cuda_beginAllocateCurrentThreadToPool = lambda *a, **kw: None
+try:
+    from torch.cuda.memory import _cuda_endAllocateToPool
+except ImportError:
+    _cuda_endAllocateToPool = lambda *a, **kw: None
+try:
+    from torch.cuda.memory import _cuda_releasePool
+except ImportError:
+    _cuda_releasePool = lambda *a, **kw: None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs

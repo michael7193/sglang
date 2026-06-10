@@ -1614,6 +1614,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # Per-layer KV readiness events for layer-pipelined disaggregation transfer.
+    layer_kv_ready_collector: Optional[object] = None
+
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
@@ -2756,6 +2759,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            layer_kv_ready_collector=self.layer_kv_ready_collector,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,

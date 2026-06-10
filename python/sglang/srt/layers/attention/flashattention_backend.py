@@ -807,6 +807,15 @@ class FlashAttentionBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
+                if not is_cp_mode:
+                    collector = getattr(forward_batch, "layer_kv_ready_collector", None)
+                    if (
+                        collector is not None
+                        and forward_batch.forward_mode.is_extend()
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        collector.record_layer_ready(layer.layer_id)
+
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
