@@ -95,6 +95,8 @@ class FakeKVSender(BaseKVSender):
         state_indices=None,
     ):
         """Per-layer KV send stub for warmup."""
+        if is_last:
+            self.has_sent = True
         logger.debug(f"FakeKVSender send_layer layer_id={layer_id} is_last={is_last}")
 
     def send_final_metadata(self, state_indices=None):

@@ -24,6 +24,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 
+from sglang.srt.compilation.piecewise_context_manager import get_pcg_capture_stream
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -812,9 +814,12 @@ class FlashAttentionBackend(AttentionBackend):
                     if (
                         collector is not None
                         and forward_batch.forward_mode.is_extend()
-                        and not torch.cuda.is_current_stream_capturing()
+                        and get_pcg_capture_stream() is None
                     ):
                         collector.record_layer_ready(layer.layer_id)
+                        dispatcher = getattr(forward_batch, "layer_kv_dispatcher", None)
+                        if dispatcher is not None:
+                            dispatcher.try_dispatch(layer.layer_id)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -1245,6 +1250,11 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Per-layer wait for pipelined decode (wait for RDMA transfer to complete)
+        counter = getattr(forward_batch, "layer_transfer_counter", None)
+        if counter is not None:
+            counter.wait_until(layer.layer_id)
+
         if k is not None:
             assert v is not None
             if save_kv_cache:

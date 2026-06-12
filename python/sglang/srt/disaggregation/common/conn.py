@@ -189,6 +189,7 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            self.layer_transfer_counters: Dict[int, "LayerTransferCounter"] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0

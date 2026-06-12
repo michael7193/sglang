@@ -302,6 +302,10 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_ENABLE_PIPELINED_KV_TRANSFER = EnvBool(False)
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(0)  # 0 = adaptive, >0 = fixed
+    SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
+    SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
+    SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
