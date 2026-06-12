@@ -36,6 +36,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.layer_kv_events import LayerTransferCounter
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -251,6 +252,9 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
+    # Per-layer transfer tracking for pipelined decode compute
+    layer_transfer_counter: Optional["LayerTransferCounter"] = None
+
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -328,6 +332,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.kv_manager = self.kv_manager
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -1034,6 +1039,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
+            # Register per-layer transfer counter for pipelined decode compute
+            num_layers = self.scheduler.model_config.num_hidden_layers
+            counter = LayerTransferCounter(num_layers)
+            decode_req.layer_transfer_counter = counter
+            self.kv_manager.layer_transfer_counters[decode_req.req.bootstrap_room] = counter
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1443,6 +1453,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        # Clean up per-layer counter from kv_manager
+        room = decode_req.req.bootstrap_room
+        if room is not None:
+            self.kv_manager.layer_transfer_counters.pop(room, None)
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1674,7 +1688,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                # Pipelined decode: if layer 0 is ready, allow early scheduling
+                counter = decode_req.layer_transfer_counter
+                if (
+                    poll == KVPoll.Transferring
+                    and counter is not None
+                    and counter.first_layer_ready
+                ):
+                    self._commit_transfer_to_req(decode_req)
+                    indices_to_remove.add(i)
+                    # Attach counter to req for per-layer wait during forward
+                    decode_req.req.layer_transfer_counter = counter
+                    transferred_reqs.append(decode_req.req)
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -1879,6 +1904,12 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
+
+        # Propagate per-layer transfer counter if any request has pipelined decode
+        for req in can_run_list:
+            if getattr(req, "layer_transfer_counter", None) is not None:
+                new_batch.layer_transfer_counter = req.layer_transfer_counter
+                break
 
         return new_batch
 

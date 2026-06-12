@@ -713,6 +713,9 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        # Per-layer transfer counter for pipelined decode compute
+        self.layer_transfer_counter = None
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -1616,6 +1619,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Per-layer KV readiness events for layer-pipelined disaggregation transfer.
     layer_kv_ready_collector: Optional[object] = None
+    # Inline dispatcher for main-thread send_layer dispatch.
+    layer_kv_dispatcher: Optional[object] = None
+    # Per-layer RDMA transfer counter for pipelined decode compute.
+    layer_transfer_counter: Optional[object] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -2760,6 +2767,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             layer_kv_ready_collector=self.layer_kv_ready_collector,
+            layer_kv_dispatcher=self.layer_kv_dispatcher,
+            layer_transfer_counter=self.layer_transfer_counter,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,

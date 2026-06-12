@@ -353,6 +353,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Per-layer KV readiness events for layer-pipelined disaggregation transfer.
     layer_kv_ready_collector: Optional[Any] = None
+    # Inline dispatcher for main-thread send_layer dispatch at group boundaries.
+    layer_kv_dispatcher: Optional[Any] = None
+    # Per-layer RDMA receive counter for pipelined decode compute.
+    layer_transfer_counter: Optional[Any] = None
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
@@ -659,6 +663,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             layer_kv_ready_collector=batch.layer_kv_ready_collector,
+            layer_kv_dispatcher=getattr(batch, "layer_kv_dispatcher", None),
+            layer_transfer_counter=getattr(batch, "layer_transfer_counter", None),
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

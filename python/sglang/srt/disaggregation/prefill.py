@@ -33,7 +33,13 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.layer_kv_events import LayerKVReadyCollector
+from sglang.srt.disaggregation.layer_kv_events import (
+    LayerKVDispatcher,
+    LayerKVReadyCollector,
+    TransferPoller,
+    build_progressive_groups,
+    compute_group_size,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -457,10 +463,103 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             batch.layer_kv_ready_collector = None
 
+    def _activate_transfer_poller(self: Scheduler, batch: ScheduleBatch) -> None:
+        batch._poller_activated = False
+        # Skip poller if inline dispatcher is active
+        if getattr(batch, "layer_kv_dispatcher", None) is not None:
+            return
+        collector = getattr(batch, "layer_kv_ready_collector", None)
+        if collector is None:
+            return
+        poller = getattr(self, "_transfer_poller", None)
+        if poller is None:
+            return
+        # Pre-compute page indices and filter eligible reqs
+        eligible_reqs = []
+        page_indices_list = []
+        for req in batch.reqs:
+            if req.pending_bootstrap or req.inflight_middle_chunks > 0:
+                continue
+            page_indices, _ = self._get_kv_page_indices_for_send(req, last_chunk=True)
+            if page_indices is None:
+                continue
+            if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), True):
+                continue
+            eligible_reqs.append(req)
+            page_indices_list.append(page_indices)
+        if not eligible_reqs:
+            return
+        # Compute adaptive group_size based on avg tokens in batch
+        avg_tokens = sum(len(req.origin_input_ids) for req in eligible_reqs) // len(eligible_reqs)
+        num_layers = len(collector.events)
+        group_size = compute_group_size(num_layers, avg_tokens)
+        group_boundaries = build_progressive_groups(num_layers, group_size)
+        poller.activate(
+            collector,
+            eligible_reqs,
+            page_indices_list,
+            self._poller_send_layer,
+            self._poller_send_final_metadata,
+            group_size=group_size,
+            group_boundaries=group_boundaries,
+        )
+        batch._poller_activated = True
+        batch._poller_eligible_rids = {req.rid for req in eligible_reqs}
+
+    def _setup_inline_dispatcher(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Set up inline dispatcher for main-thread send_layer dispatch at group boundaries."""
+        batch.layer_kv_dispatcher = None
+        collector = getattr(batch, "layer_kv_ready_collector", None)
+        if collector is None:
+            return
+        eligible_reqs = []
+        page_indices_list = []
+        for req in batch.reqs:
+            if req.pending_bootstrap or req.inflight_middle_chunks > 0:
+                continue
+            page_indices, _ = self._get_kv_page_indices_for_send(req, last_chunk=True)
+            if page_indices is None:
+                continue
+            if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), True):
+                continue
+            eligible_reqs.append(req)
+            page_indices_list.append(page_indices)
+        if not eligible_reqs:
+            return
+        avg_tokens = sum(len(req.origin_input_ids) for req in eligible_reqs) // len(eligible_reqs)
+        num_layers = len(collector.events)
+        group_size = compute_group_size(num_layers, avg_tokens)
+        group_boundaries = build_progressive_groups(num_layers, group_size)
+        batch.layer_kv_dispatcher = LayerKVDispatcher(
+            collector=collector,
+            reqs=eligible_reqs,
+            page_indices_per_req=page_indices_list,
+            group_boundaries=group_boundaries,
+            num_layers=num_layers,
+            send_layer_fn=self._poller_send_layer,
+            send_final_metadata_fn=self._poller_send_final_metadata,
+        )
+        batch._poller_activated = True
+        batch._poller_eligible_rids = {req.rid for req in eligible_reqs}
+
+    def _poller_send_layer(
+        self: Scheduler, req, page_indices, layer_id, event, is_last
+    ):
+        req.disagg_kv_sender.send_layer(
+            page_indices, layer_id, event, is_last=is_last
+        )
+
+    def _poller_send_final_metadata(self: Scheduler, req):
+        req.disagg_kv_sender.send_final_metadata(
+            self._get_last_chunk_state_indices(req)
+        )
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self._transfer_poller = TransferPoller()
+        self._transfer_poller.start()
 
         while True:
             # Receive requests
@@ -481,6 +580,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 self.prepare_layer_pipelined_kv_transfer(batch)
+                self._setup_inline_dispatcher(batch)
+                self._activate_transfer_poller(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -495,6 +596,8 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self._transfer_poller = TransferPoller()
+        self._transfer_poller.start()
 
         while True:
             # Receive requests
@@ -519,8 +622,17 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 self.prepare_layer_pipelined_kv_transfer(batch)
+                self._setup_inline_dispatcher(batch)
+                self._activate_transfer_poller(batch)
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                batch_copy = batch.copy()
+                # Propagate poller/dispatcher state to the copy for deferred process_batch_result
+                batch_copy._poller_activated = getattr(batch, "_poller_activated", False)
+                batch_copy._poller_eligible_rids = getattr(
+                    batch, "_poller_eligible_rids", set()
+                )
+                batch_copy.layer_kv_dispatcher = getattr(batch, "layer_kv_dispatcher", None)
+                self.result_queue.append((batch_copy, batch_result))
             else:
                 batch_result = None
 
@@ -574,6 +686,22 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         layer_kv_ready_collector = getattr(batch, "layer_kv_ready_collector", None)
+
+        # Check inline dispatcher completion first
+        dispatcher = getattr(batch, "layer_kv_dispatcher", None)
+        dispatcher_success = dispatcher is not None and dispatcher.all_dispatched
+
+        # A+: wait for poller completion if activated (fallback when dispatcher not used)
+        poller_activated = getattr(batch, "_poller_activated", False)
+        poller_success = False
+        if poller_activated and not dispatcher_success:
+            poller = getattr(self, "_transfer_poller", None)
+            if poller is not None:
+                # Cancel poller early if collector didn't get all events (PCG path)
+                if layer_kv_ready_collector and not layer_kv_ready_collector.all_ready():
+                    poller.cancel()
+                poller_success = poller.wait_done(timeout=5.0)
+        poller_rids = getattr(batch, "_poller_eligible_rids", set())
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -653,7 +781,14 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if not self.send_layer_pipelined_kv(req, layer_kv_ready_collector):
+                if (dispatcher_success or poller_success) and req.rid in poller_rids:
+                    # Inline dispatcher or poller already sent all layers + final metadata
+                    _, end_idx = self._get_kv_page_indices_for_send(
+                        req, last_chunk=True
+                    )
+                    if end_idx is not None:
+                        req.start_send_idx = end_idx
+                elif not self.send_layer_pipelined_kv(req, layer_kv_ready_collector):
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 

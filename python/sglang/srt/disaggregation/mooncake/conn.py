@@ -1321,6 +1321,19 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+    def sync_layer_ready_to_decode_endpoint(
+        self, remote: str, dst_port: int, room: int, layer_id: int
+    ):
+        """Notify decode that a specific layer's RDMA write has completed."""
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                b"LAYER_READY",
+                str(room).encode("ascii"),
+                str(layer_id).encode("ascii"),
+            ]
+        )
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1454,6 +1467,14 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
+                                )
+                            # Per-layer completion notification to decode
+                            if ret == 0:
+                                self.sync_layer_ready_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    kv_chunk.layer_id,
                                 )
                         elif self.is_mla_backend or (
                             self.attn_tp_size
@@ -1694,6 +1715,15 @@ class MooncakeKVManager(CommonKVManager):
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
+                    continue
+
+                # Per-layer RDMA completion notification from prefill
+                if msg[0] == b"LAYER_READY":
+                    room = int(msg[1].decode("ascii"))
+                    layer_id = int(msg[2].decode("ascii"))
+                    counter = self.layer_transfer_counters.get(room)
+                    if counter is not None:
+                        counter.complete(layer_id)
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
