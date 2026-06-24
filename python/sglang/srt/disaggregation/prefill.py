@@ -782,7 +782,12 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 if (dispatcher_success or poller_success) and req.rid in poller_rids:
-                    # Inline dispatcher or poller already sent all layers + final metadata
+                    # Inline dispatcher or poller already sent all per-layer KV.
+                    # The inline dispatcher defers send_final_metadata to here
+                    # because it needs the sampled output token (req.output_ids[0]),
+                    # which is only appended above (line 758) after the forward pass.
+                    if dispatcher_success:
+                        self._poller_send_final_metadata(req)
                     _, end_idx = self._get_kv_page_indices_for_send(
                         req, last_chunk=True
                     )

@@ -152,8 +152,10 @@ class LayerKVDispatcher:
         self.next_layer = boundary
         self.next_group_idx += 1
         if self.next_layer >= self.num_layers:
-            for req in self.reqs:
-                self.send_final_metadata_fn(req)
+            # Final metadata carries the sampled output token (req.output_ids[0]),
+            # which does not exist until after the forward pass + sampling. Defer
+            # send_final_metadata to process_batch_result_disagg_prefill (after
+            # req.output_ids.append). Here we only mark all per-layer KV dispatched.
             self.all_dispatched = True
 
 
