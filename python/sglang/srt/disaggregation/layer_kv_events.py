@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from typing import Callable, List, Optional
 
 import torch
@@ -114,7 +116,34 @@ class LayerTransferCounter:
 
 
 class LayerKVDispatcher:
-    """Inline dispatcher: dispatch send_layer from main thread at group boundaries."""
+    """Background-thread dispatcher: consume per-layer ready events OFF the main
+    forward thread and enqueue send_layer at progressive group boundaries.
+
+    Why background instead of inline (the previous Round 8 design):
+    The old ``try_dispatch(layer_id)`` was called from the attention backend hook
+    *mid-forward*, on every TP rank in lockstep at the same layer boundary. Per-rank
+    send work is asymmetric (different #pages/reqs), so ranks arrived at the FOLLOWING
+    all-reduce staggered, inflating barrier-wait by ~65% (R-reuse-6 §八). That was the
+    sole source of the reuse branch's negative gain (+21~33% slower).
+
+    Moving dispatch to a background consumer decouples it from the forward's
+    kernel-launch cadence: the main thread only calls ``record_layer_ready`` (a cheap
+    event.record() + flag set, no locking), so its kernel launches proceed unblocked
+    and ranks reach the all-reduce together. The consumer thread picks up ready layers
+    and does the (light) send_layer enqueue; the heavy cuda_event.synchronize()+RDMA
+    already runs in Mooncake's own transfer worker. Same off-main-thread approach as
+    PR #19931, which measured -12~15% on TCP.
+
+    Lifecycle: one thread per armed batch. ``start()`` right after setup (before
+    run_batch); ``wait_done()`` in process_batch_result before send_final_metadata.
+    The consumer only reads ``collector.ready[]`` (set by the main thread) via a
+    lock-free poll, so the hot forward hook stays lock-free.
+    """
+
+    # poll interval while waiting for the next group's layers to be recorded;
+    # 200us yields the GIL so the forward's kernel-launch loop is not starved,
+    # and adds at most ~200us latency per group boundary (negligible vs forward).
+    _POLL_INTERVAL_S = 0.0002
 
     def __init__(
         self,
@@ -133,31 +162,57 @@ class LayerKVDispatcher:
         self.num_layers = num_layers
         self.send_layer_fn = send_layer_fn
         self.send_final_metadata_fn = send_final_metadata_fn
-        self.next_group_idx = 0
-        self.next_layer = 0
         self.all_dispatched = False
+        self._stopped = False
+        self._done = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
-    def try_dispatch(self, layer_id: int):
-        """Called from main thread after record_layer_ready. Non-blocking RDMA enqueue."""
-        if self.all_dispatched or self.next_group_idx >= len(self.group_boundaries):
-            return
-        boundary = self.group_boundaries[self.next_group_idx]
-        if layer_id + 1 < boundary:
-            return
-        for lid in range(self.next_layer, boundary):
-            for req_idx, req in enumerate(self.reqs):
-                self.send_layer_fn(
-                    req,
-                    self.page_indices_per_req[req_idx],
-                    lid,
-                    self.collector.events[lid],
-                    lid == self.num_layers - 1,
-                )
-        self.next_layer = boundary
-        self.next_group_idx += 1
-        if self.next_layer >= self.num_layers:
+    def start(self) -> None:
+        """Spawn the background consumer. Safe to call once per batch."""
+        self._thread = threading.Thread(
+            target=self._run, name="reuse-kv-dispatch", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            next_layer = 0
+            for boundary in self.group_boundaries:
+                last_in_group = boundary - 1
+                # Wait until the main forward thread has recorded every layer up to
+                # this group boundary. record_layer_ready sets ready[lid]=True after
+                # event.record(), so a True flag guarantees the event is recorded.
+                while not self._stopped and not self.collector.ready[last_in_group]:
+                    time.sleep(self._POLL_INTERVAL_S)
+                if self._stopped:
+                    return
+                for lid in range(next_layer, boundary):
+                    event = self.collector.events[lid]
+                    is_last = lid == self.num_layers - 1
+                    for req_idx, req in enumerate(self.reqs):
+                        self.send_layer_fn(
+                            req,
+                            self.page_indices_per_req[req_idx],
+                            lid,
+                            event,
+                            is_last,
+                        )
+                next_layer = boundary
             # Final metadata carries the sampled output token (req.output_ids[0]),
-            # which does not exist until after the forward pass + sampling. Defer
+            # which does not exist until after forward + sampling. Defer
             # send_final_metadata to process_batch_result_disagg_prefill (after
             # req.output_ids.append). Here we only mark all per-layer KV dispatched.
             self.all_dispatched = True
+        finally:
+            self._done.set()
+
+    def wait_done(self, timeout: Optional[float] = None) -> bool:
+        """Join the background dispatch. Called from process_batch_result before
+        finalizing (send_final_metadata / marking success). By that point forward
+        is complete so all ready flags are set and this returns near-immediately."""
+        return self._done.wait(timeout)
+
+    def stop(self) -> None:
+        """Unblock the consumer on an abort/error path so it does not spin forever."""
+        self._stopped = True
+        self._done.set()
