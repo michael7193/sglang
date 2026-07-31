@@ -816,10 +816,13 @@ class FlashAttentionBackend(AttentionBackend):
                         and forward_batch.forward_mode.is_extend()
                         and get_pcg_capture_stream() is None
                     ):
+                        # Only record the per-layer ready event here (cheap stream op
+                        # + flag set, lock-free). The actual send_layer enqueue is done
+                        # by the background LayerKVDispatcher consumer thread, NOT inline
+                        # on this forward path — inline dispatch injected TP-asymmetric
+                        # work mid-forward and inflated all-reduce barrier-wait ~65%
+                        # (R-reuse-6 §八). The consumer polls collector.ready[].
                         collector.record_layer_ready(layer.layer_id)
-                        dispatcher = getattr(forward_batch, "layer_kv_dispatcher", None)
-                        if dispatcher is not None:
-                            dispatcher.try_dispatch(layer.layer_id)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata

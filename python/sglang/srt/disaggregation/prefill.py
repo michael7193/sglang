@@ -463,11 +463,13 @@ class SchedulerDisaggregationPrefillMixin:
             batch.layer_kv_ready_collector = None
 
     def _setup_inline_dispatcher(self: Scheduler, batch: ScheduleBatch) -> None:
-        """Set up inline dispatcher for main-thread send_layer dispatch at group boundaries.
+        """Set up the background dispatcher for off-main-thread send_layer dispatch.
 
-        This is the single per-layer KV send mechanism. It dispatches send_layer from
-        the main thread at progressive group boundaries (right after record_layer_ready),
-        so there is exactly one mechanism and no background-thread / GIL contention.
+        The consumer thread enqueues send_layer at progressive group boundaries as
+        the forward records each layer's ready event. Dispatch is kept OFF the main
+        forward thread (unlike the old inline try_dispatch) so it does not inject
+        TP-asymmetric work mid-forward, which previously inflated all-reduce
+        barrier-wait ~65% (R-reuse-6 §八) and caused the reuse branch's negative gain.
         """
         batch.layer_kv_dispatcher = None
         collector = getattr(batch, "layer_kv_ready_collector", None)
@@ -501,8 +503,9 @@ class SchedulerDisaggregationPrefillMixin:
             send_final_metadata_fn=self._dispatch_send_final_metadata,
         )
         batch._dispatch_eligible_rids = {req.rid for req in eligible_reqs}
+        batch.layer_kv_dispatcher.start()
         logger.info(
-            "[REUSE_DEBUG] inline dispatcher armed: reqs=%d avg_tokens=%d "
+            "[REUSE_DEBUG] bg dispatcher armed: reqs=%d avg_tokens=%d "
             "num_layers=%d group_size=%d groups=%d",
             len(eligible_reqs),
             avg_tokens,
@@ -529,7 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         logger.info(
-            "[REUSE_PIPELINE] inline-dispatcher KV transfer enabled=%s "
+            "[REUSE_PIPELINE] bg-dispatcher KV transfer enabled=%s "
             "(hicache-reuse branch, normal event loop)",
             envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get(),
         )
@@ -570,7 +573,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         logger.info(
-            "[REUSE_PIPELINE] inline-dispatcher KV transfer enabled=%s "
+            "[REUSE_PIPELINE] bg-dispatcher KV transfer enabled=%s "
             "(hicache-reuse branch, overlap event loop)",
             envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get(),
         )
@@ -661,8 +664,30 @@ class SchedulerDisaggregationPrefillMixin:
 
         layer_kv_ready_collector = getattr(batch, "layer_kv_ready_collector", None)
 
-        # Inline dispatcher is the single per-layer send mechanism.
+        # Background dispatcher is the single per-layer send mechanism. Join it
+        # before finalizing so all per-layer KV chunks are enqueued (in same-room
+        # FIFO order) ahead of the final metadata chunk. Forward is complete here
+        # (copy_done synchronized above), so if the collector was fully populated
+        # every ready flag is set and wait_done returns near-immediately.
+        #
+        # Guard: if the forward did NOT record all layers (e.g. the attention hook
+        # was skipped under PCG/cuda-graph capture), the consumer would spin on a
+        # flag that never flips. Detect via collector.all_ready() and bail to the
+        # legacy fallback (send_layer_pipelined_kv / send_kv_chunk), matching the
+        # old inline design's graceful degradation. A generous timeout is a second
+        # safety net against any unforeseen deadlock.
         dispatcher = getattr(batch, "layer_kv_dispatcher", None)
+        if dispatcher is not None:
+            collector = getattr(batch, "layer_kv_ready_collector", None)
+            if collector is not None and collector.all_ready():
+                if not dispatcher.wait_done(timeout=30.0):
+                    logger.warning(
+                        "[REUSE_DEBUG] bg dispatcher wait_done timed out; "
+                        "falling back to synchronous send"
+                    )
+                    dispatcher.stop()
+            else:
+                dispatcher.stop()
         dispatcher_success = dispatcher is not None and dispatcher.all_dispatched
         dispatch_rids = getattr(batch, "_dispatch_eligible_rids", set())
 
